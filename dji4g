@@ -1,0 +1,1348 @@
+#!/usr/bin/env bash
+#===============================================================================
+# dji4g -- DJI 1st-gen 4G USB Module CLI Manager
+# Device:  2ca3:4006 "Baiwang" (ZTE V1E / Quectel QDC507)
+# Target:  Linux (PVE, Ubuntu, Debian, CentOS, Raspberry Pi OS, OpenWRT)
+# Note:    RouterOS is not supported (non-Linux userland, needs separate impl.)
+# Version: 2.0.0
+#===============================================================================
+set -o pipefail
+
+readonly USB_VID="2ca3" USB_PID="4006" PRODUCT_NAME="Baiwang"
+readonly DEFAULT_APN="CTNET" MODULE_GATEWAY="192.168.225.1"
+readonly SCRIPT_VERSION="2.0.0"
+
+# ----[ Global State ]----
+DISTRO="" DISTRO_ID="" DISTRO_VER=""
+KERNEL_VER="" ARCH=""
+DEVICE_USB_PATH=""   # e.g. "5-2"
+AT_PORT=""           # e.g. /dev/ttyUSB2
+NET_IFACE=""         # e.g. enxfa255dfa425c
+NO_COLOR=false; JSON_OUT=false
+DHCP_CLIENT=""       # auto-detected: dhclient or udhcpc
+
+# ----[ Colors ]----
+C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'
+C_BLUE='\033[34m'; C_CYAN='\033[36m'; C_RESET='\033[0m'
+C_BOLD='\033[1m'; C_DIM='\033[2m'
+_color() { $NO_COLOR && { echo -n ""; return; }; echo -ne "$1"; }
+_reset() { $NO_COLOR && return; echo -ne "$C_RESET"; }
+
+# ----[ Utility Functions ]----
+die() { local code="${1:-1}"; shift; printf "%bERROR:%b %s\n" "$(_color "$C_RED$C_BOLD")" "$(_reset)" "$*" >&2; exit "$code"; }
+warn() { printf "%bWARN:%b %s\n" "$(_color "$C_YELLOW$C_BOLD")" "$(_reset)" "$*" >&2; }
+info() { printf "%b==>%b %s\n" "$(_color "$C_CYAN")" "$(_reset)" "$*"; }
+ok()   { printf "  %b[OK]%b %s\n" "$(_color "$C_GREEN")" "$(_reset)" "$*"; }
+fail() { printf "  %b[FAIL]%b %s\n" "$(_color "$C_RED$C_BOLD")" "$(_reset)" "$*"; }
+step() { printf "  %b[%s]%b %s" "$(_color "$C_BOLD")" "$1" "$(_reset)" "$2"; }
+header() { printf "\n%b%s%b\n" "$(_color "$C_BOLD$C_CYAN")" "$1" "$(_reset)"; printf '%*s\n' "${#1}" '' | tr ' ' '='; }
+_keyval() { local key="$1" val="$2" w="${3:-26}"; printf "  %-*s %s\n" "$w" "${key}:" "$val"; }
+_trim() { echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+_json_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; echo -n "$s"; }
+_is_numeric() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac }
+
+# ----[ Distro Detection ]----
+
+detect_distro() {
+    KERNEL_VER=$(uname -r)
+    ARCH=$(uname -m)
+
+    if [ -f /etc/os-release ]; then
+        DISTRO_ID=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"' | head -1)
+        DISTRO_VER=$(grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"' | head -1)
+    elif [ -f /etc/openwrt_release ]; then
+        DISTRO_ID="openwrt"
+        DISTRO_VER=$(grep 'DISTRIB_RELEASE' /etc/openwrt_release | cut -d"'" -f2)
+    elif [ -f /etc/debian_version ]; then
+        DISTRO_ID="debian"
+        DISTRO_VER=$(cat /etc/debian_version)
+    elif [ -f /etc/redhat-release ]; then
+        DISTRO_ID="centos"
+        DISTRO_VER=$(cat /etc/redhat-release | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    elif [ -f /etc/rpi-issue ]; then
+        DISTRO_ID="raspbian"
+    fi
+
+    # Normalize common variants
+    case "$DISTRO_ID" in
+        ubuntu|debian|raspbian|linuxmint|pop|elementary|kali)  DISTRO="debian" ;;
+        centos|rhel|fedora|rocky|almalinux|amzn)               DISTRO="rhel" ;;
+        openwrt|lede)                                           DISTRO="openwrt" ;;
+        proxmox|pve)                                            DISTRO="debian"; DISTRO_ID="pve" ;;
+        *)                                                      DISTRO="${DISTRO_ID:-unknown}" ;;
+    esac
+
+    # DHCP client auto-detection
+    if command -v dhclient &>/dev/null; then
+        DHCP_CLIENT="dhclient"
+    elif command -v udhcpc &>/dev/null; then
+        DHCP_CLIENT="udhcpc"
+    else
+        DHCP_CLIENT=""
+    fi
+}
+
+# ----[ Tool Check ]----
+
+check_tool() { local t="$1" pkg="${2:-$1}" msg="${3:-}"; if ! command -v "$t" &>/dev/null; then [ -n "$msg" ] && die 4 "$msg"; die 4 "Missing tool: '$t'. Install: $pkg"; fi; }
+
+check_tools() {
+    check_tool "cat" "" "cat is required"
+    check_tool "grep" "" "grep is required"
+    check_tool "sed" "" "sed is required"
+    check_tool "head" "" "head is required"
+
+    case "$DISTRO" in
+        debian|rhel)
+            check_tool "lsusb" "usbutils" "Install: apt-get install usbutils / yum install usbutils"
+            check_tool "ip" "iproute2" "Install: apt-get install iproute2 / yum install iproute"
+            check_tool "$DHCP_CLIENT" "${DHCP_CLIENT}" "DHCP client required"
+            ;;
+        openwrt)
+            # OpenWRT: tools in /usr/sbin, busybox-based
+            [ -x /usr/sbin/lsusb ] || [ -x /bin/lsusb ] || warn "lsusb not found (opkg install usbutils)"
+            [ -n "$DHCP_CLIENT" ] || warn "No DHCP client found (opkg install udhcpc)"
+            ;;
+    esac
+}
+
+# ----[ Device Discovery ]----
+
+find_device() {
+    for vendor_file in /sys/bus/usb/devices/*/idVendor; do
+        [ "$(cat "$vendor_file" 2>/dev/null)" = "$USB_VID" ] || continue
+        local dev_dir pid
+        dev_dir=$(dirname "$vendor_file")
+        pid=$(cat "$dev_dir/idProduct" 2>/dev/null)
+        [ "$pid" = "$USB_PID" ] || continue
+        local basename
+        basename=$(basename "$dev_dir")
+        DEVICE_USB_PATH="$basename"
+        return 0
+    done
+    return 1
+}
+
+find_serial_ports() {
+    local found=false
+    for p in /dev/ttyUSB*; do
+        [ -e "$p" ] && echo "$p" && found=true
+    done
+    $found && return 0 || return 1
+}
+
+find_at_port() {
+    for port in /dev/ttyUSB*; do
+        [ -e "$port" ] || continue
+        local resp
+        resp=$(_at_send_raw "$port" "AT" 1 2>/dev/null)
+        if echo "$resp" | grep -q "OK"; then
+            echo "$port"; return 0
+        fi
+    done
+    return 1
+}
+
+find_net_iface() {
+    for iface in /sys/class/net/*; do
+        local name; name=$(basename "$iface")
+        case "$name" in enx*|usb[0-9]*) ;; *) continue ;; esac
+        local device_link
+        device_link=$(readlink "$iface/device" 2>/dev/null)
+        if echo "$device_link" | grep -q "$DEVICE_USB_PATH"; then
+            echo "$name"; return 0
+        fi
+    done
+    return 1
+}
+
+# ----[ AT Communication ]----
+
+_at_send_raw() {
+    local port="$1" cmd="$2" t="${3:-3}"
+    stty -F "$port" 115200 raw -echo -echoe -echok -echoctl 2>/dev/null || true
+    if command -v timeout &>/dev/null; then
+        timeout "$t" sh -c "printf '%s\r' '$cmd' > '$port'; cat '$port' & pid=\$!; sleep $t; kill \$pid 2>/dev/null" 2>/dev/null
+    else
+        # BusyBox fallback (OpenWRT): background cat, sleep, kill
+        printf '%s\r' "$cmd" > "$port"
+        local outfile; outfile="/tmp/dji4g_at_$$"
+        ( cat "$port" > "$outfile" 2>/dev/null ) & local cpid=$!
+        sleep "$t"; kill $cpid 2>/dev/null; wait $cpid 2>/dev/null
+        cat "$outfile" 2>/dev/null; rm -f "$outfile" 2>/dev/null
+    fi
+}
+
+at_send() {
+    local port="${1:-$AT_PORT}" cmd="$2" timeout="${3:-5}"
+    [ -z "$port" ] && die 2 "No AT port found. Is the device plugged in?"
+    local raw; raw=$(_at_send_raw "$port" "$cmd" "$timeout" 2>/dev/null)
+    echo "$raw" | grep -v "^$cmd$" | grep -v "^$" | grep -v "^AT$"
+}
+
+# ----[ Driver Operations ]----
+
+_need_root() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    die 3 "This command requires root. Run with: sudo dji4g $*"
+}
+
+# Check if device is connected (AT port + drivers). Prints guidance if not.
+_need_connect() {
+    find_device || { echo "Device not found. Is the 4G module plugged in?"; return 1; }
+    AT_PORT=$(find_at_port 2>/dev/null)
+    if [ -z "$AT_PORT" ]; then
+        echo "Not connected. Drivers not loaded."
+        echo "Run:  sudo dji4g connect"
+        return 1
+    fi
+    return 0
+}
+
+driver_load_all() {
+    local errors=0
+    for mod in option cdc_ether rndis_host usbnet; do
+        if ! modprobe "$mod" 2>/dev/null; then
+            # modprobe fails without root; if module already loaded it's harmless
+            lsmod 2>/dev/null | grep -q "^${mod} " && continue
+            warn "Cannot load module '$mod' (not root?)"
+            errors=$((errors + 1))
+        fi
+    done
+    sleep 1
+    # Register VID/PID with option driver
+    if [ -f /sys/bus/usb-serial/drivers/option1/new_id ]; then
+        if ! echo "2ca3 4006 ff" > /sys/bus/usb-serial/drivers/option1/new_id 2>/dev/null; then
+            warn "Cannot register device ID with option driver (need root)"
+            errors=$((errors + 1))
+        fi
+    fi
+    sleep 1
+    return $errors
+}
+
+driver_bind() {
+    local driver="$1" iface="$2"
+    [ -f "/sys/bus/usb/drivers/${driver}/bind" ] || { fail "Driver '$driver' not available (missing kernel module?)"; return 1; }
+    # Skip if already bound
+    [ -L "/sys/bus/usb/devices/${iface}/driver" ] && return 0
+    echo -n "$iface" > "/sys/bus/usb/drivers/${driver}/bind" 2>/dev/null || { fail "Cannot bind $driver to $iface (need root?)"; return 1; }
+}
+
+driver_unbind() {
+    local driver="$1" iface="$2"
+    [ -f "/sys/bus/usb/drivers/${driver}/unbind" ] || { return 1; }
+    echo -n "$iface" > "/sys/bus/usb/drivers/${driver}/unbind" 2>/dev/null || true
+}
+
+# ----[ Modem Operations ]----
+
+modem_get_info()     { at_send "${1:-$AT_PORT}" "ATI" 3; }
+modem_get_operator() { at_send "${1:-$AT_PORT}" "AT+COPS?" 5 | grep "+COPS:" | head -1; }
+
+modem_get_signal() {
+    local port="${1:-$AT_PORT}" resp rssi ber
+    resp=$(at_send "$port" "AT+CSQ" 3)
+    if echo "$resp" | grep -q "+CSQ:"; then
+        local csv; csv=$(echo "$resp" | grep "+CSQ:" | head -1 | sed 's/.*+CSQ: *//')
+        rssi=$(echo "$csv" | cut -d',' -f1 | tr -d ' ')
+        ber=$(echo "$csv" | cut -d',' -f2 | tr -d ' ')
+        echo "${rssi:-?} ${ber:-?}"; return 0
+    fi
+    echo "? ?"; return 1
+}
+
+_rssi_to_dbm() {
+    local rssi="$1"; _is_numeric "$rssi" || { echo "N/A"; return; }
+    [ "$rssi" -eq 99 ] && { echo "unknown"; return; }
+    [ "$rssi" -ge 31 ] && { echo ">=-51"; return; }
+    echo "$(( -113 + rssi * 2 ))"
+}
+
+_rssi_to_bar() {
+    local rssi="$1" max="${2:-31}" width="${3:-20}"
+    _is_numeric "$rssi" || { printf '%*s' "$width" '' | tr ' ' '?'; return; }
+    [ "$rssi" -ge 99 ] && { printf '%*s' "$width" '' | tr ' ' '-'; return; }
+    local filled=$(( rssi * width / max ))
+    [ "$filled" -gt "$width" ] && filled="$width"
+    printf '%*s' "$filled" '' | tr ' ' '#'; printf '%*s' "$((width - filled))" '' | tr ' ' '.'
+}
+
+_rssi_to_percent() {
+    local rssi="$1"; _is_numeric "$rssi" || { echo "0"; return; }
+    [ "$rssi" -eq 99 ] && { echo "0"; return; }
+    [ "$rssi" -ge 31 ] && { echo "100"; return; }
+    echo "$(( (rssi + 1) * 100 / 32 ))"
+}
+
+modem_get_registration() {
+    local port="${1:-$AT_PORT}" creg cereg cgatt
+    creg=$(at_send "$port" "AT+CREG?" 3 | grep "+CREG:" | head -1 | sed 's/.*+CREG: *//')
+    cereg=$(at_send "$port" "AT+CEREG?" 3 | grep "+CEREG:" | head -1 | sed 's/.*+CEREG: *//')
+    cgatt=$(at_send "$port" "AT+CGATT?" 3 | grep "+CGATT:" | head -1 | sed 's/.*+CGATT: *//')
+    echo "CREG=$creg"; echo "CEREG=$cereg"; echo "CGATT=$cgatt"
+}
+
+_creg_status() {
+    local s; s=$(echo "$1" | tr -d '\r\n ' | sed 's/[^0-9]//g')
+    case "$s" in
+        0) echo "not registered, not searching" ;;
+        1) echo "registered, home network" ;;
+        2) echo "not registered, searching" ;;
+        3) echo "registration denied" ;;
+        4) echo "unknown" ;;
+        5) echo "registered, roaming" ;;
+        *) echo "unknown ($s)" ;;
+    esac
+}
+
+modem_get_pdp_status()  { at_send "${1:-$AT_PORT}" "AT+CGACT?" 4 | grep "+CGACT:"; }
+modem_get_ip()          { at_send "${1:-$AT_PORT}" "AT+CGPADDR=1" 4 | grep "+CGPADDR:" | head -1 | sed 's/.*+CGPADDR: *//'; }
+modem_get_apn()         { at_send "${1:-$AT_PORT}" "AT+CGDCONT?" 4 | grep "+CGDCONT:"; }
+
+modem_activate_pdp() {
+    local port="${1:-$AT_PORT}" resp
+    resp=$(at_send "$port" "AT+CGACT=1,1" 5)
+    echo "$resp" | grep -q "OK" && return 0 || return 1
+}
+
+modem_cfun_reset() {
+    local port="${1:-$AT_PORT}"
+    info "Sending airplane mode (CFUN=4)..."
+    at_send "$port" "AT+CFUN=4" 5 >/dev/null; sleep 3
+    info "Restoring full functionality (CFUN=1)..."
+    at_send "$port" "AT+CFUN=1" 5 >/dev/null
+    info "Waiting for USB re-enumeration..."; sleep 5
+}
+
+modem_get_serving_cell() {
+    local port="${1:-$AT_PORT}" resp
+    resp=$(at_send "$port" 'AT+QENG="servingcell"' 5)
+    echo "$resp" | grep -q "+QENG:" && { echo "$resp" | grep "+QENG:"; return 0; }
+    resp=$(at_send "$port" "AT+QNWINFO" 3)
+    echo "$resp" | grep -q "+QNWINFO:" && { echo "$resp" | grep "+QNWINFO:"; return 0; }
+    return 1
+}
+
+modem_scan_operators() {
+    info "Scanning operators (may take up to 60s)..."
+    at_send "${1:-$AT_PORT}" "AT+COPS=?" 65
+}
+
+# ----[ Network Operations ]----
+
+net_iface_up()   { ip link set "$1" up 2>/dev/null || ifconfig "$1" up 2>/dev/null; }
+net_iface_down() { ip link set "$1" down 2>/dev/null || ifconfig "$1" down 2>/dev/null; }
+
+net_dhcp_acquire() {
+    local iface="$1" ip=""
+    info "Requesting DHCP on $iface..."
+    case "$DHCP_CLIENT" in
+        dhclient)
+            # Suppress dhclient's own default route, let 'dji4g route add' control it
+            dhclient -e 'DEFROUTE=no' -e 'IF_METRIC=100' "$iface" >/dev/null 2>&1
+            net_del_default_route "$MODULE_GATEWAY" 2>/dev/null
+            ;;
+        udhcpc)   udhcpc -i "$iface" -q >/dev/null 2>&1 ;;
+        *) warn "No DHCP client available"; return 8 ;;
+    esac
+    ip=$(ip -4 addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1 | head -1)
+    [ -n "$ip" ] && echo "IP_ASSIGNED=$ip" && return 0
+    return 8
+}
+
+net_dhcp_release() {
+    case "$DHCP_CLIENT" in
+        dhclient) dhclient -r "$1" 2>/dev/null ;;
+        udhcpc)   udhcpc -i "$1" -R 2>/dev/null ;;
+    esac
+}
+
+net_add_default_route() {
+    # Use metric 50 so it coexists with system default routes (usually metric 100)
+    ip route replace default via "${1:-$MODULE_GATEWAY}" dev "$2" metric 50 2>/dev/null
+}
+net_del_default_route() { ip route del default via "${1:-$MODULE_GATEWAY}" metric 50 2>/dev/null; }
+
+net_test_ping() {
+    ping -c 2 -W 3 -I "$1" 8.8.8.8 2>&1 | tail -3
+}
+
+net_test_http() {
+    local iface="$1" ip
+    ip=$(ip -4 addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+    if command -v curl &>/dev/null; then
+        curl -s --interface "$iface" --connect-timeout 5 -o /dev/null -w '%{http_code}' http://baidu.com 2>/dev/null
+    elif command -v wget &>/dev/null; then
+        wget -q --bind-address="$ip" --timeout=5 -O /dev/null http://baidu.com 2>/dev/null && echo "200" || echo "000"
+    else
+        echo "no_http_client"
+    fi
+}
+
+# ----[ USB Monitor ]----
+
+monitor_usb() {
+    if command -v udevadm &>/dev/null; then
+        info "Monitoring USB events (Ctrl+C to stop)..."
+        udevadm monitor --kernel --subsystem-match=usb 2>&1 | while read -r line; do
+            echo "[$(date '+%H:%M:%S')] $line"
+        done
+    else
+        info "Polling lsusb every 2s (Ctrl+C to stop)..."
+        while true; do
+            local found=false; find_device && found=true
+            echo "[$(date '+%H:%M:%S')] Device: $($found && echo 'ATTACHED' || echo 'NOT FOUND')"
+            sleep 2
+        done
+    fi
+}
+
+# ----[ Debug: USB ]----
+
+debug_usb() {
+    header "USB Topology"
+    if command -v lsusb &>/dev/null; then
+        echo "  $(lsusb 2>/dev/null | grep "$USB_VID:$USB_PID")"
+    fi
+    echo ""
+    # Ensure debugfs is mounted (needed for lsusb -t and interface map)
+    if [ ! -f /sys/kernel/debug/usb/devices ] && [ "$(id -u)" -eq 0 ]; then
+        mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+    fi
+
+    echo ""
+    header "USB Device Tree"
+    local tree_out
+    tree_out=$(lsusb -t 2>/dev/null | grep -A1 -B2 "$USB_VID:$USB_PID" 2>/dev/null)
+    if [ -n "$tree_out" ]; then echo "$tree_out"; else echo "  (lsusb -t not available)"; fi
+
+    echo ""
+    header "Interface Map"
+    if [ -f /sys/kernel/debug/usb/devices ]; then
+        cat /sys/kernel/debug/usb/devices | grep -A 30 "Vendor=$USB_VID" | grep -E '^I:\*' | while read -r line; do
+            # Only show active alternates (I:*)
+            local iface alt drv raw_cls raw_sub raw_prot
+            iface=$(echo "$line" | sed 's/.*If#= *//' | awk '{print $1}')
+            alt=$(echo "$line" | sed 's/.*Alt= *//' | awk '{print $1}')
+            drv=$(echo "$line" | grep -o 'Driver=([^)]*)\|Driver=[^ ]*' | sed 's/Driver=//')
+            [ -z "$drv" ] && drv="none"
+            raw_cls=$(echo "$line" | sed 's/.*Cls=//' | sed 's/[^0-9a-fA-F].*//')
+            raw_sub=$(echo "$line" | sed 's/.*Sub=//' | sed 's/[^0-9a-fA-F].*//')
+            raw_prot=$(echo "$line" | sed 's/.*Prot=//' | sed 's/[^0-9a-fA-F].*//')
+            # Map class numbers to names
+            local cls_label
+            case "${raw_cls}" in
+                02) cls_label="02(comm.)" ;; 0a) cls_label="0a(data)" ;; ff) cls_label="ff(vend.)" ;; *) cls_label="${raw_cls}" ;;
+            esac
+            printf "  If%s: class=%-10s sub=%-4s prot=%-4s driver=%s\n" "${iface:-?}" "${cls_label}" "${raw_sub}" "${raw_prot}" "${drv:-none}"
+        done 2>/dev/null
+    else
+        echo "  (debugfs not available)"
+    fi
+
+    echo ""
+    header "Device Descriptors"
+    local desc_out
+    desc_out=$(lsusb -v -d "$USB_VID:$USB_PID" 2>/dev/null)
+    if [ -n "$desc_out" ]; then echo "$desc_out" | head -80; else echo "  (lsusb -v not available)"; fi
+}
+
+# ----[ Debug: Driver ]----
+
+debug_driver() {
+    header "Loaded Kernel Modules"
+    for mod in option cdc_ether usbnet rndis_host qmi_wwan cdc_wdm cdc_acm; do
+        local loaded="not loaded"
+        lsmod 2>/dev/null | grep -q "^${mod} " && loaded="loaded"
+        _keyval "$mod" "$loaded"
+    done
+
+    echo ""
+    header "Interface Driver Bindings"
+    for i in /sys/bus/usb/devices/${DEVICE_USB_PATH}/${DEVICE_USB_PATH}*/driver; do
+        local iface driver
+        iface=$(basename "$(dirname "$i")" 2>/dev/null)
+        driver=$(basename "$(readlink "$i" 2>/dev/null)" 2>/dev/null)
+        [ -n "$iface" ] && echo "  $iface -> ${driver:-unbound}"
+    done 2>/dev/null
+
+    echo ""
+    header "Recent Driver Kernel Messages"
+    dmesg 2>/dev/null | grep -iE 'option|cdc_ether|rndis|qmi_wwan|usbnet' | tail -15 || echo "  (dmesg not available)"
+}
+
+# ----[ Debug: Modem ]----
+
+debug_modem() {
+    local port="${1:-$AT_PORT}"
+    [ -z "$port" ] && { fail "No AT port available"; return 1; }
+
+    header "Modem Interrogation (AT Commands)"
+    info "Sending ~20 AT commands..."
+
+    local cmds=(
+        "Identity|ATI"
+        "Manufacturer|AT+CGMI"
+        "Model|AT+CGMM"
+        "Revision|AT+CGMR"
+        "Serial/IMEI|AT+CGSN"
+        "IMSI|AT+CIMI"
+        "ICCID|AT+QCCID"
+        "SIM Status|AT+QSIMSTAT?"
+        "PIN Status|AT+CPIN?"
+        "Functionality|AT+CFUN?"
+        "Signal Quality|AT+CSQ"
+        "Operator|AT+COPS?"
+        "CS Registration|AT+CREG?"
+        "EPS Registration|AT+CEREG?"
+        "GPRS Attach|AT+CGATT?"
+        "PDP Contexts|AT+CGACT?"
+        "APN Config|AT+CGDCONT?"
+        "Assigned IP|AT+CGPADDR=1"
+        "USB Composition|AT+QCFG=\"usbnet\""
+        "Serving Cell|AT+QENG=\"servingcell\""
+        "Network Info|AT+QNWINFO"
+        "Temperature|AT+QTEMP"
+    )
+
+    local total=${#cmds[@]} i=0 ok_n=0 fail_n=0
+    for entry in "${cmds[@]}"; do
+        i=$((i + 1))
+        local label cmd; label="${entry%%|*}"; cmd="${entry##*|}"
+
+        step "$i/$total" "$label... "
+        local resp clean
+        resp=$(at_send "$port" "$cmd" 4 2>/dev/null)
+        clean=$(echo "$resp" | grep -v "^$cmd$" | grep -v "^AT$")
+
+        if echo "$clean" | grep -q "ERROR"; then
+            printf "%bERROR%b\n" "$(_color "$C_RED")" "$(_reset)"
+            fail_n=$((fail_n + 1))
+            echo "      $(echo "$clean" | head -1)"
+        elif [ -z "$(echo "$clean" | tr -d '[:space:]')" ]; then
+            printf "%bno response%b\n" "$(_color "$C_YELLOW")" "$(_reset)"
+            fail_n=$((fail_n + 1))
+        else
+            printf "%bOK%b\n" "$(_color "$C_GREEN")" "$(_reset)"
+            ok_n=$((ok_n + 1))
+            echo "      $(echo "$clean" | head -1)"
+        fi
+    done
+
+    echo ""
+    echo "  Results: ${C_GREEN}${ok_n} OK${C_RESET}, ${C_RED}${fail_n} failed${C_RESET} / $total total"
+}
+
+# ----[ Debug: Network ]----
+
+debug_network() {
+    local port="${1:-$AT_PORT}"
+    [ -z "$port" ] && { fail "No AT port available"; return 1; }
+
+    header "Network Diagnostics"
+
+    echo ""; info "Network Registration:"
+    local reg; reg=$(modem_get_registration "$port")
+    echo "$reg" | while IFS='=' read -r k v; do
+        case "$k" in
+            CREG)  _keyval "CS Registration" "$v - $(_creg_status "${v##*,}")" ;;
+            CEREG) _keyval "EPS Registration" "$v - $(_creg_status "${v##*,}")" ;;
+            CGATT) _keyval "GPRS Attach" "$v" ;;
+        esac
+    done
+
+    echo ""; info "Signal Quality:"
+    local sig rssi ber; sig=$(modem_get_signal "$port")
+    rssi=$(echo "$sig" | awk '{print $1}'); ber=$(echo "$sig" | awk '{print $2}')
+    _keyval "RSSI" "$rssi ($(_rssi_to_dbm "$rssi") dBm, ~$(_rssi_to_percent "$rssi")%)"
+    _keyval "BER" "$ber"
+    printf "  %-26s [" "Signal:"; printf '%s' "$(_rssi_to_bar "$rssi" 31 30)"; echo "]"
+
+    echo ""; info "Serving Cell:"
+    local cell; cell=$(modem_get_serving_cell "$port")
+    [ -n "$cell" ] && echo "  $cell" || echo "  (not available)"
+
+    echo ""; info "PDP Contexts:"
+    modem_get_pdp_status "$port" | while read -r line; do
+        [ -z "$line" ] && continue
+        local cid state; cid=$(echo "$line" | sed 's/+CGACT: *//' | cut -d',' -f1)
+        state=$(echo "$line" | sed 's/+CGACT: *[0-9]*,//')
+        case "$state" in 1) state="${C_GREEN}ACTIVE${C_RESET}" ;; 0) state="${C_DIM}inactive${C_RESET}" ;; esac
+        printf "  CID %s: %b\n" "$cid" "$state"
+    done
+
+    echo ""; info "APN Configuration:"
+    modem_get_apn "$port" | while read -r line; do [ -z "$line" ] && continue; echo "  $line"; done
+
+    echo ""; info "Assigned IP:"
+    _keyval "IP Address" "$(modem_get_ip "$port")"
+}
+
+# ----[ Debug: Connectivity ]----
+
+debug_connectivity() {
+    header "End-to-End Connectivity Test"; echo ""
+    local total_start status=0; total_start=$(date +%s)
+
+    # Step 1
+    local step_start; step_start=$(date +%s)
+    step "1/15" "Device detection"
+    if find_device; then echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - $DEVICE_USB_PATH"
+    else echo -e " ${C_RED}FAIL${C_RESET} - Device not found"; return 2; fi
+
+    # Step 2
+    step_start=$(date +%s)
+    step "2/15" "AT port detection"
+    AT_PORT=$(find_at_port)
+    if [ -n "$AT_PORT" ]; then echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - $AT_PORT"
+    else echo -e " ${C_RED}FAIL${C_RESET}"; return 2; fi
+
+    # Step 3
+    step_start=$(date +%s)
+    step "3/15" "AT communication"
+    if at_send "$AT_PORT" "AT" 3 | grep -q "OK"; then echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s)"
+    else echo -e " ${C_RED}FAIL${C_RESET}"; return 6; fi
+
+    # Step 4
+    step_start=$(date +%s)
+    step "4/15" "Modem functionality (CFUN)"
+    local cfun; cfun=$(at_send "$AT_PORT" "AT+CFUN?" 3 | grep "+CFUN:" | head -1 | sed 's/+CFUN: *//' | tr -d '\r\n ')
+    if [ -n "$cfun" ]; then echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - CFUN=$cfun"
+    else echo -e " ${C_YELLOW}WARN${C_RESET}"; fi
+
+    # Step 5
+    step_start=$(date +%s)
+    step "5/15" "SIM status (CPIN)"
+    local cpin; cpin=$(at_send "$AT_PORT" "AT+CPIN?" 4 | grep "+CPIN:" | head -1 | sed 's/+CPIN: *//' | tr -d '\r\n ')
+    if echo "$cpin" | grep -qi "READY"; then echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - SIM READY"
+    elif [ -n "$cpin" ]; then echo -e " ${C_RED}FAIL${C_RESET} - $cpin"; status=2
+    else echo -e " ${C_YELLOW}WARN${C_RESET} (eSIM?)"; fi
+
+    # Step 6
+    step_start=$(date +%s)
+    step "6/15" "LTE registration (CEREG)"
+    local cereg cereg_stat
+    cereg=$(at_send "$AT_PORT" "AT+CEREG?" 4 | grep "+CEREG:" | head -1 | sed 's/+CEREG: *//')
+    cereg_stat=$(echo "${cereg##*,}" | tr -d '\r\n ')
+    if [ "$cereg_stat" = "1" ] || [ "$cereg_stat" = "5" ]; then
+        echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - $(_creg_status "$cereg_stat")"
+    else echo -e " ${C_RED}FAIL${C_RESET} - $(_creg_status "${cereg_stat:-?}")"; status=2; fi
+
+    # Step 7
+    step_start=$(date +%s)
+    step "7/15" "PDP context config"
+    local apn; apn=$(modem_get_apn "$AT_PORT" | head -1)
+    if [ -n "$apn" ]; then echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - $apn"
+    else echo -e " ${C_YELLOW}WARN${C_RESET}"; fi
+
+    # Step 8
+    step_start=$(date +%s)
+    step "8/15" "PDP activation"
+    local pdp; pdp=$(modem_get_pdp_status "$AT_PORT" | grep "1," | head -1)
+    if echo "$pdp" | grep -q ",1"; then echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - Already active"
+    elif modem_activate_pdp "$AT_PORT"; then echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - Activated"
+    else echo -e " ${C_RED}FAIL${C_RESET}"; status=2; fi
+
+    # Step 9
+    step_start=$(date +%s)
+    step "9/15" "IP address"
+    local ip; ip=$(modem_get_ip "$AT_PORT")
+    if [ -n "$ip" ] && [ "$ip" != "0.0.0.0" ]; then echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - $ip"
+    else echo -e " ${C_YELLOW}WARN${C_RESET}"; fi
+
+    # Step 10
+    step_start=$(date +%s)
+    step "10/15" "ECM interface"
+    lsmod 2>/dev/null | grep -q "^cdc_ether " || { modprobe cdc_ether 2>/dev/null; sleep 2; }
+    NET_IFACE=$(find_net_iface)
+    if [ -z "$NET_IFACE" ]; then
+        local ecm_iface
+        ecm_iface=$(cat /sys/kernel/debug/usb/devices 2>/dev/null | grep -A 30 "Vendor=$USB_VID" | grep "Cls=02(comm.)" | grep -o 'If#= *[0-9]*' | head -1 | awk '{print $2}')
+        [ -n "$ecm_iface" ] && { driver_bind "cdc_ether" "${DEVICE_USB_PATH}:1.${ecm_iface}"; sleep 2; }
+        NET_IFACE=$(find_net_iface)
+    fi
+    [ -n "$NET_IFACE" ] && echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - $NET_IFACE" || { echo -e " ${C_RED}FAIL${C_RESET}"; status=2; }
+
+    # Steps 11-15: Network (only if interface exists)
+    if [ -n "$NET_IFACE" ]; then
+        step_start=$(date +%s)
+        step "11/15" "Interface UP"
+        net_iface_up "$NET_IFACE"; sleep 1
+        local link_state; link_state=$(ip link show "$NET_IFACE" 2>/dev/null | grep -o 'state [A-Z_]*' | awk '{print $2}')
+        [ -z "$link_state" ] && link_state=$(ifconfig "$NET_IFACE" 2>/dev/null | grep -q "UP" && echo "UP")
+        echo -e " $([ "$link_state" = "UP" ] || echo "$link_state" | grep -qE "UNKNOWN|LOWER_UP" && echo "${C_GREEN}OK${C_RESET}" || echo "${C_YELLOW}WARN${C_RESET}") ($(( $(date +%s) - step_start ))s) - ${link_state:-unknown}"
+
+        step_start=$(date +%s)
+        step "12/15" "DHCP"
+        local dhcp_ip
+        dhcp_ip=$(net_dhcp_acquire "$NET_IFACE" 2>&1 | grep -o 'bound to [0-9.]*\|IP_ASSIGNED=[0-9.]*' | grep -o '[0-9.]*' | head -1)
+        [ -z "$dhcp_ip" ] && dhcp_ip=$(ip -4 addr show "$NET_IFACE" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1 | head -1)
+        [ -n "$dhcp_ip" ] && echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - $dhcp_ip" || { echo -e " ${C_RED}FAIL${C_RESET}"; status=8; }
+
+        step_start=$(date +%s)
+        step "13/15" "Default route"
+        net_add_default_route "$MODULE_GATEWAY" "$NET_IFACE"; sleep 1
+        ip route show 2>/dev/null | grep -q "$MODULE_GATEWAY" && echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s)" || echo -e " ${C_YELLOW}WARN${C_RESET}"
+
+        step_start=$(date +%s)
+        step "14/15" "Ping 8.8.8.8"
+        ping -c 2 -W 3 -I "$NET_IFACE" 8.8.8.8 >/dev/null 2>&1 && echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s)" || { echo -e " ${C_RED}FAIL${C_RESET}"; status=9; }
+
+        step_start=$(date +%s)
+        step "15/15" "HTTP connectivity"
+        local http; http=$(net_test_http "$NET_IFACE")
+        [ -n "$http" ] && [ "$http" != "000" ] && echo -e " ${C_GREEN}OK${C_RESET} ($(( $(date +%s) - step_start ))s) - HTTP $http" || { echo -e " ${C_RED}FAIL${C_RESET}"; status=9; }
+    fi
+
+    local total_elapsed=$(( $(date +%s) - total_start ))
+    echo ""; echo "  ─────────────────────────────────────"
+    [ "$status" -eq 0 ] && echo -e "  ${C_GREEN}${C_BOLD}RESULT: 4G connection fully operational${C_RESET}" || echo -e "  ${C_RED}${C_BOLD}RESULT: Issues detected (code $status)${C_RESET}"
+    echo "  Total time: ${total_elapsed}s"
+}
+
+# ----[ Debug: System ]----
+
+debug_system() {
+    header "System Information"
+    _keyval "Distro" "$DISTRO_ID ${DISTRO_VER}"
+    _keyval "Distro Family" "$DISTRO"
+    _keyval "Kernel" "$KERNEL_VER"
+    _keyval "Architecture" "$ARCH"
+    _keyval "DHCP Client" "${DHCP_CLIENT:-none}"
+
+    echo ""; header "USB Controllers"
+    lspci 2>/dev/null | grep -i 'usb' | while read -r line; do echo "  $line"; done
+    [ $? -ne 0 ] && echo "  (lspci not available)"
+
+    echo ""; info "USB Power Management:"
+    for pm in /sys/bus/usb/devices/usb*/power/control; do
+        [ -f "$pm" ] || continue
+        local bus; bus=$(echo "$pm" | grep -o 'usb[0-9]*')
+        local st; st=$(cat "$pm" 2>/dev/null || echo "unknown")
+        _keyval "$bus autosuspend" "$st"
+    done
+
+    echo ""; header "Known-Good Configuration Comparison"
+
+    local checks=()
+    # Kernel check
+    local k_major k_minor k_ok=false
+    k_major=$(echo "$KERNEL_VER" | cut -d. -f1)
+    k_minor=$(echo "$KERNEL_VER" | cut -d. -f2)
+    [ "$k_major" -ge 6 ] || { [ "$k_major" -ge 5 ] && [ "$k_minor" -ge 4 ]; } && k_ok=true
+    checks+=("Kernel >= 5.4|$($k_ok && echo "PASS" || echo "FAIL")|CDC ECM needs kernel 5.4+")
+
+    checks+=("cdc_ether module|$(lsmod 2>/dev/null | grep -q "^cdc_ether " && echo "PASS" || echo "WARN")|Load: modprobe cdc_ether")
+    checks+=("option module|$(lsmod 2>/dev/null | grep -q "^option " && echo "PASS" || echo "WARN")|Load: modprobe option")
+    checks+=("ip command|$(command -v ip &>/dev/null && echo "PASS" || echo "FAIL")|iproute2 required")
+    checks+=("DHCP client|$([ -n "$DHCP_CLIENT" ] && echo "PASS" || echo "FAIL")|dhclient or udhcpc required")
+    checks+=("lsusb|$(command -v lsusb &>/dev/null && echo "PASS" || echo "WARN")|usbutils recommended")
+
+    # USB autosuspend
+    local as_disabled=true
+    for f in /sys/bus/usb/devices/usb*/power/control; do
+        [ -f "$f" ] && [ "$(cat "$f" 2>/dev/null)" != "on" ] && as_disabled=false
+    done
+    checks+=("USB autosuspend=off|$($as_disabled && echo "PASS" || echo "WARN")|May interfere with modem")
+
+    # Distro-specific checks
+    case "$DISTRO" in
+        debian) checks+=("apt package mgr|$(command -v apt-get &>/dev/null && echo "PASS" || echo "FAIL")|apt-get required") ;;
+        rhel)   checks+=("yum/dnf pkg mgr|$(command -v yum &>/dev/null && echo "PASS" || command -v dnf &>/dev/null && echo "PASS" || echo "FAIL")|yum/dnf required") ;;
+        openwrt) checks+=("opkg pkg mgr|$(command -v opkg &>/dev/null && echo "PASS" || echo "FAIL")|opkg required") ;;
+    esac
+
+    printf "  %-27s %-6s  %s\n" "Check" "Status" "Note"
+    printf "  %-27s %-6s  %s\n" "-----" "------" "----"
+    for check in "${checks[@]}"; do
+        local item status note
+        item="${check%%|*}"; rest="${check#*|}"; status="${rest%%|*}"; note="${rest#*|}"
+        local color=""
+        case "$status" in PASS) color="$C_GREEN" ;; FAIL) color="$C_RED$C_BOLD" ;; WARN) color="$C_YELLOW" ;; esac
+        printf "  %-27s %b%-6s%b  %s\n" "$item" "$(_color "$color")" "$status" "$(_reset)" "$note"
+    done
+}
+
+# ----[ Preflight Dependency Check ]----
+
+# Returns 0 if all deps satisfied, dies with error otherwise.
+# By default auto-installs missing packages (if root). Use --check for dry-run.
+_preflight_check() {
+    local mode="auto"  # auto | check
+    [ "$1" = "--check" ] && mode="check"
+
+    local is_root=false
+    [ "$(id -u)" -eq 0 ] && is_root=true
+
+    local missing_kmods=() missing_tools=() missing_pkgs=()
+
+    # 1. Kernel modules that must exist on disk (modinfo)
+    for kmod in option cdc_ether; do
+        modinfo "$kmod" &>/dev/null || missing_kmods+=("$kmod")
+    done
+
+    # 2. Userspace tools
+    local tools_check=(
+        "lsusb:usbutils"
+        "ip:iproute2"
+        "stty:coreutils"
+    )
+    case "$DHCP_CLIENT" in dhclient) ;; udhcpc) ;; *) tools_check+=("dhclient:isc-dhcp-client") ;; esac
+    command -v timeout &>/dev/null || command -v socat &>/dev/null || \
+        missing_tools+=("socat:socat")
+
+    for entry in "${tools_check[@]}"; do
+        command -v "${entry%%:*}" &>/dev/null || missing_tools+=("$entry")
+    done
+
+    # 3. debugfs
+    [ -f /sys/kernel/debug/usb/devices ] || ! mount | grep -q debugfs 2>/dev/null && \
+        missing_pkgs+=("debugfs not mounted")
+
+    # Nothing missing = done
+    [ ${#missing_kmods[@]} -eq 0 ] && [ ${#missing_tools[@]} -eq 0 ] && [ ${#missing_pkgs[@]} -eq 0 ] && return 0
+
+    # ---- Something missing ----
+    echo ""
+    header "Preflight: Installing Dependencies"
+
+    # Build package list
+    local to_install=""
+
+    # Kernel modules → linux-modules-extra on Debian-family
+    if [ ${#missing_kmods[@]} -gt 0 ]; then
+        case "$DISTRO" in
+            debian) to_install="$to_install linux-modules-extra-$(uname -r)" ;;
+            rhel)   to_install="$to_install kernel-modules-extra" ;;
+            openwrt)
+                for m in "${missing_kmods[@]}"; do
+                    case "$m" in
+                        option) to_install="$to_install kmod-usb-serial-option" ;;
+                        cdc_ether) to_install="$to_install kmod-usb-net-cdc-ether" ;;
+                    esac
+                done
+                ;;
+        esac
+    fi
+
+    # Userspace tools
+    for entry in "${missing_tools[@]}"; do
+        local pkg="${entry##*:}"
+        to_install="$to_install $pkg"
+    done
+
+    # Strip whitespace
+    to_install=$(echo "$to_install" | xargs)
+
+    echo ""
+    local missing_msg=""
+    [ ${#missing_kmods[@]} -gt 0 ] && missing_msg="kernel modules: ${missing_kmods[*]}"
+    [ ${#missing_tools[@]} -gt 0 ] && missing_msg="${missing_msg:+$missing_msg; }tools: ${missing_tools[*]%%:*}"
+    [ -n "$missing_msg" ] && info "Missing: $missing_msg"
+    [ -n "$to_install" ] && info "Packages: $to_install"
+
+    if [ "$mode" = "check" ]; then
+        echo ""
+        case "$DISTRO" in
+            debian) echo "  Run: sudo apt-get install -y $to_install" ;;
+            rhel)   echo "  Run: sudo yum install -y $to_install" ;;
+            openwrt) echo "  Run: opkg install $to_install" ;;
+        esac
+        return 4
+    fi
+
+    # Auto-install
+    if ! $is_root; then
+        echo ""
+        warn "Root required to install packages. Run with sudo, or:"
+        case "$DISTRO" in
+            debian) echo "  sudo apt-get install -y $to_install" ;;
+            rhel)   echo "  sudo yum install -y $to_install" ;;
+            openwrt) echo "  opkg install $to_install" ;;
+        esac
+        return 4
+    fi
+
+    case "$DISTRO" in
+        debian)
+            info "Installing with apt-get..."
+            apt-get update -qq 2>/dev/null
+            apt-get install -y $to_install 2>&1 | tail -3
+            ;;
+        rhel)
+            info "Installing with yum..."
+            yum install -y $to_install 2>&1 | tail -3
+            ;;
+        openwrt)
+            info "Installing with opkg..."
+            opkg update 2>/dev/null
+            opkg install $to_install 2>&1
+            ;;
+    esac
+
+    # Re-check
+    echo ""
+    local ok=true
+    for kmod in "${missing_kmods[@]}"; do
+        modinfo "$kmod" &>/dev/null || { fail "Still missing module: $kmod"; ok=false; }
+    done
+    for entry in "${missing_tools[@]}"; do
+        command -v "${entry%%:*}" &>/dev/null || { fail "Still missing tool: ${entry%%:*}"; ok=false; }
+    done
+
+    if $ok; then
+        ok "All dependencies satisfied."
+        return 0
+    else
+        die 4 "Some dependencies could not be installed. Check your package sources."
+    fi
+}
+
+cmd_preflight() {
+    detect_distro; check_tools
+    _preflight_check "$@"
+}
+
+# ----[ Commands ]----
+
+cmd_connect() {
+    _need_root "connect"
+    _preflight_check || return $?
+    local force=false apn="$DEFAULT_APN" add_route=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=true ;;
+            --route) add_route=true ;;
+            --apn) shift; apn="$1" ;;
+        esac; shift
+    done
+
+    info "Connecting DJI 4G module..."; echo ""
+
+    step "1/6" "Device discovery"
+    find_device && echo -e " ${C_GREEN}OK${C_RESET} - $DEVICE_USB_PATH" || { echo -e " ${C_RED}FAIL${C_RESET}"; die 2 "Device not found"; }
+
+    step "2/6" "Load kernel modules"
+    driver_load_all; echo -e " ${C_GREEN}OK${C_RESET}"
+
+    step "3/6" "Find AT command port"
+    AT_PORT=$(find_at_port)
+    [ -n "$AT_PORT" ] && echo -e " ${C_GREEN}OK${C_RESET} - $AT_PORT" || { echo -e " ${C_RED}FAIL${C_RESET}"; die 2 "No AT port. Try --force"; }
+
+    if $force; then
+        step "4/6" "Force CFUN reset"
+        modem_cfun_reset "$AT_PORT"; sleep 3
+        AT_PORT=$(find_at_port); echo -e " ${C_GREEN}OK${C_RESET}"
+    else
+        step "4/6" "CFUN reset"
+        echo -e " ${C_DIM}skipped${C_RESET} (use --force to enable)"
+    fi
+
+    step "5/6" "Ensure PDP active"
+    modem_activate_pdp "$AT_PORT" && echo -e " ${C_GREEN}OK${C_RESET}" || echo -e " ${C_YELLOW}(may already be active)${C_RESET}"
+
+    step "6/6" "Network setup"
+    local ecm_iface
+    ecm_iface=$(cat /sys/kernel/debug/usb/devices 2>/dev/null | grep -A 30 "Vendor=$USB_VID" | grep "Cls=02(comm.)" | grep -o 'If#= *[0-9]*' | head -1 | awk '{print $2}')
+    [ -n "$ecm_iface" ] && { driver_bind "cdc_ether" "${DEVICE_USB_PATH}:1.${ecm_iface}"; sleep 2; }
+    NET_IFACE=$(find_net_iface)
+    [ -z "$NET_IFACE" ] && { echo -e " ${C_RED}FAIL${C_RESET}"; die 2 "No ECM interface. Try --force"; }
+
+    net_iface_up "$NET_IFACE"; sleep 1; net_dhcp_acquire "$NET_IFACE" >/dev/null 2>&1
+
+    local ip; ip=$(ip -4 addr show "$NET_IFACE" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+
+    if $add_route; then
+        net_add_default_route "$MODULE_GATEWAY" "$NET_IFACE"
+        echo -e " ${C_GREEN}OK${C_RESET} - $ip on $NET_IFACE (+ default route)"
+    else
+        echo -e " ${C_GREEN}OK${C_RESET} - $ip on $NET_IFACE (use --route or 'dji4g route add')"
+    fi
+
+    echo ""; info "Connected! Testing connectivity..."
+    # Connectivity test: if --route, use default; otherwise bind to interface
+    local ping_ok=false
+    if $add_route; then
+        ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1 && ping_ok=true
+    else
+        ping -c 2 -W 3 -I "$NET_IFACE" 8.8.8.8 >/dev/null 2>&1 && ping_ok=true
+    fi
+
+    if $ping_ok; then
+        echo ""; header "Connection Active"
+        _keyval "Interface" "$NET_IFACE"; _keyval "IP Address" "$ip"; _keyval "Gateway" "$MODULE_GATEWAY"
+        if command -v curl &>/dev/null; then
+            local pub_ip=""
+            if $add_route; then
+                pub_ip=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null)
+            else
+                pub_ip=$(curl -s --interface "$NET_IFACE" --connect-timeout 5 ifconfig.me 2>/dev/null)
+            fi
+            _keyval "Public IP" "${pub_ip:-unknown}"
+        fi
+        local sig; sig=$(modem_get_signal "$AT_PORT"); _keyval "Signal" "$(echo "$sig" | awk '{print $1}') RSSI"
+    else warn "Interface is up but ping failed. Check debug connectivity for details."; fi
+}
+
+cmd_disconnect() {
+    _need_root "disconnect"
+    info "Disconnecting DJI 4G module..."
+
+    # Remove any default routes via the 4G module gateway
+    ip route show | grep "default via $MODULE_GATEWAY" | while read -r r; do
+        ip route del $r 2>/dev/null
+    done
+
+    # Release and down interface
+    local iface; iface=$(find_net_iface 2>/dev/null)
+    [ -n "$iface" ] && { net_dhcp_release "$iface" 2>/dev/null; net_iface_down "$iface" 2>/dev/null; }
+
+    # Unbind drivers
+    local dev_path="$DEVICE_USB_PATH"
+    [ -z "$dev_path" ] && find_device && dev_path="$DEVICE_USB_PATH"
+    if [ -n "$dev_path" ]; then
+        for i in 0 1 2 3 4 5; do
+            driver_unbind "cdc_ether" "${dev_path}:1.${i}" 2>/dev/null
+            driver_unbind "option" "${dev_path}:1.${i}" 2>/dev/null
+        done
+    fi
+    echo ""; ok "Disconnected."
+}
+
+cmd_route_add() {
+    _need_root "route add"
+    NET_IFACE=$(find_net_iface 2>/dev/null)
+    if [ -z "$NET_IFACE" ]; then
+        echo "No ECM interface found. Device needs to be connected first."
+        echo "Run:  sudo dji4g connect"
+        return 1
+    fi
+    net_add_default_route "$MODULE_GATEWAY" "$NET_IFACE"
+    ok "Default route added via $MODULE_GATEWAY dev $NET_IFACE"
+}
+
+cmd_route_del() {
+    _need_root "route del"
+    net_del_default_route "$MODULE_GATEWAY" 2>/dev/null
+    ok "Default route via $MODULE_GATEWAY removed"
+}
+
+cmd_route_show() {
+    header "Routes via 4G Module ($MODULE_GATEWAY)"
+    ip route show 2>/dev/null | grep "$MODULE_GATEWAY" || echo "  (no routes)"
+}
+
+cmd_route() {
+    local action="${1:-show}"
+    case "$action" in
+        add)  cmd_route_add ;;
+        del)  cmd_route_del ;;
+        show) cmd_route_show ;;
+        *)    die 1 "Usage: dji4g route <add|del|show>" ;;
+    esac
+}
+
+cmd_status() {
+    local watch=0
+    while [ $# -gt 0 ]; do case "$1" in --json) JSON_OUT=true ;; --watch) shift; watch="$1" ;; esac; shift 2>/dev/null || break; done
+
+    _status_once() {
+        # Level 0: Device not found
+        if ! find_device; then
+            if $JSON_OUT; then
+                echo '{"status":"not_found","device":null}'
+            else
+                echo "Status: DEVICE NOT FOUND"
+                echo ""
+                echo "  The DJI 4G module is not plugged in."
+                echo "  Check USB cable and run:  dji4g env"
+            fi
+            return 0
+        fi
+
+        # Level 1: Device found, check connection state
+        [ -z "$AT_PORT" ] && AT_PORT=$(find_at_port 2>/dev/null)
+        local iface ip_addr
+        iface=$(find_net_iface 2>/dev/null)
+        [ -n "$iface" ] && ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1 | head -1)
+
+        local connected=false
+        [ -n "$AT_PORT" ] && [ -n "$ip_addr" ] && connected=true
+
+        if ! $connected; then
+            if $JSON_OUT; then
+                printf '{"status":"disconnected","device":"%s","at_port":"%s","interface":"%s"}\n' \
+                    "$DEVICE_USB_PATH" "${AT_PORT:-none}" "${iface:-none}"
+            else
+                echo "Status: NOT CONNECTED"
+                echo ""
+                _keyval "USB Path" "$DEVICE_USB_PATH"
+                _keyval "AT Port" "${AT_PORT:-not loaded}"
+                _keyval "Network" "${iface:-not found}"
+                echo ""
+                echo "  Run to bring online:"
+                echo "    sudo dji4g connect"
+            fi
+            return 0
+        fi
+
+        # Level 2: Fully connected
+        local sig_rssi="?" sig_ber="?" pub_ip="none"
+        if [ -n "$AT_PORT" ]; then
+            local sig; sig=$(modem_get_signal "$AT_PORT" 2>/dev/null)
+            sig_rssi=$(echo "$sig" | awk '{print $1}'); sig_ber=$(echo "$sig" | awk '{print $2}')
+        fi
+        [ -n "$ip_addr" ] && command -v curl &>/dev/null && \
+            pub_ip=$(curl -s --interface "$iface" --connect-timeout 3 ifconfig.me 2>/dev/null || echo "timeout")
+
+        if $JSON_OUT; then
+            printf '{"status":"connected","usb_path":"%s","at_port":"%s","signal_rssi":%s,"signal_dbm":"%s","signal_percent":%s,"network_interface":"%s","ip_address":"%s","public_ip":"%s","distro":"%s"}\n' \
+                "$DEVICE_USB_PATH" "${AT_PORT:-none}" "$sig_rssi" "$(_rssi_to_dbm "$sig_rssi")" "$(_rssi_to_percent "$sig_rssi")" \
+                "${iface:-none}" "${ip_addr:-none}" "${pub_ip:-none}" "$DISTRO_ID"
+        else
+            header "DJI 4G Module Status"
+            _keyval "Device" "$PRODUCT_NAME ($DEVICE_USB_PATH)" ; _keyval "AT Port" "$AT_PORT"
+            _keyval "Signal" "${sig_rssi} RSSI ($(_rssi_to_dbm "$sig_rssi") dBm, ~$(_rssi_to_percent "$sig_rssi")%)"
+            _keyval "BER" "$sig_ber"; _keyval "Interface" "$iface"
+            _keyval "IP Address" "$ip_addr"; _keyval "Public IP" "${pub_ip:-N/A}"
+            echo ""; printf "  %-26s [" "Signal Bar"; printf '%s' "$(_rssi_to_bar "$sig_rssi" 31 30)"; echo "]"
+        fi
+    }
+
+    if [ "$watch" -gt 0 ] 2>/dev/null; then
+        while true; do clear 2>/dev/null || true; _status_once; echo ""; echo "  Refreshing every ${watch}s (Ctrl+C to stop)"; sleep "$watch"; done
+    else _status_once; fi
+}
+
+cmd_info() {
+    _need_connect || return 0
+
+    header "Device Identity"
+    _keyval "USB Vendor" "0x$USB_VID"; _keyval "USB Product" "0x$USB_PID"
+    _keyval "Product Name" "$PRODUCT_NAME"; _keyval "USB Path" "$DEVICE_USB_PATH"
+
+    if [ -n "$AT_PORT" ]; then
+        echo ""; header "Modem Information"
+        local model rev imei imsi
+        model=$(at_send "$AT_PORT" "AT+CGMM" 3 | grep -v "^$" | head -1 | tr -d '\r\n')
+        rev=$(at_send "$AT_PORT" "AT+CGMR" 3 | grep -v "^$" | head -1 | tr -d '\r\n')
+        imei=$(at_send "$AT_PORT" "AT+CGSN" 3 | grep -E '^[0-9]{14,16}' | head -1 | tr -d '\r\n')
+        imsi=$(at_send "$AT_PORT" "AT+CIMI" 3 | grep -E '^[0-9]{14,16}' | head -1 | tr -d '\r\n')
+        _keyval "Model" "${model:-unknown}"; _keyval "Revision" "${rev:-unknown}"
+        _keyval "IMEI" "${imei:-unknown}"; _keyval "IMSI" "${imsi:-unknown}"
+
+        echo ""; header "Network Status"
+        local reg; reg=$(modem_get_registration "$AT_PORT")
+        _keyval "CS Registration" "$(echo "$reg" | grep CREG | cut -d= -f2)"
+        _keyval "EPS Registration" "$(echo "$reg" | grep CEREG | cut -d= -f2)"
+        _keyval "GPRS Attach" "$(echo "$reg" | grep CGATT | cut -d= -f2)"
+        _keyval "PDP Status" "$(modem_get_pdp_status "$AT_PORT" | head -1)"
+        _keyval "Assigned IP" "$(modem_get_ip "$AT_PORT" | tr -d '\r\n')"
+
+        echo ""; header "Signal"
+        local sig rssi ber; sig=$(modem_get_signal "$AT_PORT")
+        rssi=$(echo "$sig" | awk '{print $1}'); ber=$(echo "$sig" | awk '{print $2}')
+        _keyval "RSSI" "$rssi ($(_rssi_to_dbm "$rssi") dBm)"; _keyval "BER" "$ber"
+        _keyval "Strength" "$(_rssi_to_percent "$rssi")%"
+        printf "  %-26s [" "Bar"; printf '%s' "$(_rssi_to_bar "$rssi" 31 30)"; echo "]"
+    fi
+}
+
+cmd_signal() {
+    local graph=false watch=0
+    while [ $# -gt 0 ]; do case "$1" in --graph) graph=true ;; --watch) shift; watch="$1" ;; --json) JSON_OUT=true ;; esac; shift 2>/dev/null || break; done
+
+    _signal_once() {
+        _need_connect || return 0
+
+        local sig rssi ber dbm pct; sig=$(modem_get_signal "$AT_PORT")
+        rssi=$(echo "$sig" | awk '{print $1}'); ber=$(echo "$sig" | awk '{print $2}')
+        dbm=$(_rssi_to_dbm "$rssi"); pct=$(_rssi_to_percent "$rssi")
+
+        if $JSON_OUT; then
+            printf '{"rssi":%s,"dbm":"%s","percent":%s,"ber":%s}\n' "$rssi" "$dbm" "$pct" "$ber"
+        elif $graph; then
+            printf '\rRSSI: %-3s [%s] %s%% %s dBm  ' "$rssi" "$(_rssi_to_bar "$rssi" 31 40)" "$pct" "$dbm"
+        else printf "RSSI: %s (%s dBm, ~%s%%)  BER: %s\n" "$rssi" "$dbm" "$pct" "$ber"; fi
+    }
+
+    if [ "$watch" -gt 0 ] 2>/dev/null; then
+        while true; do _signal_once; $graph && echo "" || true; sleep "$watch"; done
+    else _signal_once; $graph && echo "" || true; fi
+}
+
+cmd_at() {
+    local port="" raw=false
+    while [ $# -gt 0 ]; do case "$1" in --port) shift; port="$1" ;; --raw) raw=true ;; *) break ;; esac; shift; done
+    local cmd="$*"; [ -z "$cmd" ] && die 1 "Usage: dji4g at <AT_COMMAND>"
+    if [ -z "$port" ]; then
+        _need_connect || return 0
+        port="$AT_PORT"
+    fi
+
+    if $raw; then _at_send_raw "$port" "$cmd" 5
+    else at_send "$port" "$cmd" 5; fi
+}
+
+cmd_debug() {
+    local group="$1"
+    [ -z "$group" ] && {
+        echo "Usage: dji4g debug <group>"
+        echo ""; echo "Debug groups:"
+        echo "  usb            USB descriptors, topology, interface map"
+        echo "  driver         Kernel modules, driver bindings, logs"
+        echo "  modem          Full AT interrogation (~20 commands)"
+        echo "  network        Registration, cell, PDP diagnostics"
+        echo "  connectivity   Step-by-step timed end-to-end test (15 steps)"
+        echo "  system         OS/distro/kernel/config comparison"; exit 1; }
+
+    case "$group" in
+        usb)          find_device || die 2 "Device not found."; debug_usb ;;
+        driver)       find_device || die 2 "Device not found."; debug_driver ;;
+        modem)        _need_connect || exit 0; debug_modem "$AT_PORT" ;;
+        network)      _need_connect || exit 0; debug_network "$AT_PORT" ;;
+        connectivity) _need_connect || exit 0; debug_connectivity ;;
+        system)       debug_system ;;
+        *)            die 1 "Unknown debug group: $group. Valid: usb driver modem network connectivity system" ;;
+    esac
+}
+
+cmd_dump() {
+    local json=false file=""
+    while [ $# -gt 0 ]; do case "$1" in --json) json=true ;; --file) shift; file="$1" ;; esac; shift 2>/dev/null || break; done
+    [ -n "$file" ] && exec > "$file" 2>&1
+
+    if $json; then
+        echo '{'; echo '  "timestamp": "'$(date -Iseconds 2>/dev/null || date)'",'
+        echo '  "distro": {"id":"'$DISTRO_ID'","family":"'$DISTRO'","version":"'$DISTRO_VER'"},'
+        echo '  "kernel": "'$KERNEL_VER'",'; echo '  "arch": "'$ARCH'"'
+        find_device && {
+            AT_PORT=$(find_at_port 2>/dev/null)
+            echo '  ,"device": {"found":true,"bus_path":"'$DEVICE_USB_PATH'"'
+            [ -n "$AT_PORT" ] && {
+                echo '    ,"at_port":"'$AT_PORT'"'
+                local sig; sig=$(modem_get_signal "$AT_PORT" 2>/dev/null)
+                echo '    ,"signal_rssi":'$(echo "$sig" | awk '{print $1}')
+                local model; model=$(at_send "$AT_PORT" "AT+CGMM" 3 2>/dev/null | grep -v "^$" | head -1 | tr -d '\n\r')
+                echo '    ,"model":"'$model'"'
+            }; echo '  }'
+        } || echo '  ,"device": {"found":false}'
+        echo '}'
+    else
+        echo "DJI 4G Module Full Diagnostic Dump"
+        echo "Generated: $(date)"; echo "Distro: $DISTRO_ID $DISTRO_VER ($DISTRO)"
+        echo "Kernel: $KERNEL_VER / $ARCH"; echo ""
+        AT_PORT=""
+        if find_device; then AT_PORT=$(find_at_port 2>/dev/null); fi
+        debug_system; debug_usb; debug_driver
+        if [ -n "$AT_PORT" ]; then
+            debug_modem "$AT_PORT"; debug_network "$AT_PORT"
+            debug_connectivity
+        else
+            echo ""; echo "  ─────────────────────────────────────"
+            echo "  Skipped: modem / network / connectivity (device not connected)"
+            echo "  Run:  sudo dji4g connect"
+        fi
+    fi
+}
+
+cmd_monitor() { monitor_usb; }
+
+cmd_env() {
+    header "Platform Environment"
+    _keyval "Distro" "$DISTRO_ID ${DISTRO_VER}"; _keyval "Distro Family" "$DISTRO"
+    _keyval "Kernel" "$KERNEL_VER"; _keyval "Architecture" "$ARCH"
+
+    echo ""; header "Available Tools"
+    for t in lsusb ip modprobe dhclient udhcpc socat timeout curl wget ping udevadm; do
+        command -v "$t" &>/dev/null && _keyval "$t" "available" || _keyval "$t" "MISSING"
+    done
+
+    echo ""; header "Device Status"
+    if find_device; then
+        _keyval "Device" "Found at $DEVICE_USB_PATH"
+        AT_PORT=$(find_at_port 2>/dev/null); _keyval "AT Port" "${AT_PORT:-not found}"
+        NET_IFACE=$(find_net_iface 2>/dev/null); _keyval "Network IFace" "${NET_IFACE:-not found}"
+    else _keyval "Device" "Not found"; fi
+}
+
+# ----[ Help ]----
+
+cmd_help() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        connect)   echo "Usage: dji4g connect [--force] [--route] [--apn APN]"; echo ""; echo "Bring up 4G connection. --route also adds default route."; echo "  --force  Force CFUN reset before connecting"; echo "  --route  Add default route via 4G module after connecting"; echo "  --apn    Set APN (default: $DEFAULT_APN)" ;;
+        disconnect) echo "Usage: dji4g disconnect"; echo ""; echo "Tear down connection: remove route, release DHCP, unbind drivers." ;;
+        route)     echo "Usage: dji4g route <add|del|show>"; echo ""; echo "Manage default route through 4G module."; echo "  add    Add default route via $MODULE_GATEWAY"; echo "  del    Remove default route via $MODULE_GATEWAY"; echo "  show   Show current routes via module" ;;
+        status)    echo "Usage: dji4g status [--json] [--watch N]"; echo ""; echo "Show connection status. --watch for live refresh." ;;
+        info)      echo "Usage: dji4g info"; echo ""; echo "Print modem identity, registration, signal quality." ;;
+        signal)    echo "Usage: dji4g signal [--graph] [--watch N] [--json]"; echo ""; echo "Display signal quality with optional ASCII bar graph." ;;
+        at)        echo "Usage: dji4g at [--port PORT] [--raw] <AT_COMMAND>"; echo ""; echo "Send raw AT command. Example: dji4g at AT+CSQ" ;;
+        debug)     echo "Usage: dji4g debug <usb|driver|modem|network|connectivity|system>"; echo ""; echo "Layered diagnostics from hardware up to HTTP." ;;
+        dump)      echo "Usage: dji4g dump [--json] [--file PATH]"; echo ""; echo "Run ALL debug groups at once." ;;
+        monitor)   echo "Usage: dji4g monitor"; echo ""; echo "Watch for USB device attach/detach events." ;;
+        env)       echo "Usage: dji4g env"; echo ""; echo "Print platform/distro info and tool availability." ;;
+        *)
+            echo "dji4g v$SCRIPT_VERSION -- DJI 1st-gen 4G USB Module CLI Manager"
+            echo ""; echo "Usage: dji4g <command> [options]"
+            echo ""; echo "Commands:"
+            echo "  preflight     Check dependencies (--fix to auto-install)"
+            echo "  connect       Bring up 4G connection (ECM + DHCP, no default route)"
+            echo "  disconnect    Tear down connection"
+            echo "  route         Manage default route (add|del|show)"
+            echo "  status        Connection status, signal, IP"
+            echo "  info          Modem identity, registration, signal"
+            echo "  signal        Signal quality display"
+            echo "  at            Send raw AT command"
+            echo ""; echo "  debug <group> Layered diagnostics (usb|driver|modem|network|connectivity|system)"
+            echo "  dump          Full diagnostic dump"
+            echo "  monitor       USB hotplug monitor"
+            echo "  env           Platform environment info"
+            echo ""; echo "Use 'dji4g <command> --help' for detailed options."
+            echo ""; echo "Device:  ${USB_VID}:${USB_PID} ($PRODUCT_NAME)"
+            echo "Distro:  $DISTRO_ID ($DISTRO)"
+            ;;
+    esac
+}
+
+# ----[ Main ]----
+
+parse_args() {
+    while [ $# -gt 0 ]; do case "$1" in
+        --no-color) NO_COLOR=true; shift ;;
+        --json) JSON_OUT=true; shift ;;
+        --help|-h) cmd_help ""; exit 0 ;;
+        -*) die 1 "Unknown option: $1. Use --help." ;;
+        *) break ;;
+    esac; done
+
+    local command="${1:-help}"; shift 2>/dev/null || true
+
+    case "$command" in
+        preflight)    cmd_preflight "$@" ;;
+        connect)      cmd_connect "$@" ;;
+        disconnect)   cmd_disconnect "$@" ;;
+        route)        cmd_route "$@" ;;
+        status)       cmd_status "$@" ;;
+        info)         cmd_info "$@" ;;
+        signal)       cmd_signal "$@" ;;
+        at)           cmd_at "$@" ;;
+        debug)        cmd_debug "$@" ;;
+        dump)         cmd_dump "$@" ;;
+        monitor)      cmd_monitor "$@" ;;
+        env)          cmd_env "$@" ;;
+        help|--help|-h) cmd_help "$@" ;;
+        *)
+            if echo "$command" | grep -qi '^AT'; then cmd_at "$command" "$@"
+            else die 1 "Unknown command: $command. Use --help."; fi ;;
+    esac
+}
+
+main() {
+    detect_distro
+    check_tools
+    parse_args "$@"
+}
+
+[[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"
