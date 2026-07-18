@@ -1034,9 +1034,9 @@ cmd_cell() {
     # QNWINFO fallback: tech, band, earfcn
     if [ -n "$qnw" ]; then
         [ -z "$tech" ] && tech=$(echo "$qnw" | awk -F',' '{gsub(/[" ]/,"",$1); sub(/\+QNWINFO:/,""); print $1}')
-        local qband; qband=$(echo "$qnw" | awk -F',' '{gsub(/[" ]/,"",$3); print $3}' | sed 's/LTEBAND/LTE Band /;s/NRBAND/NR Band /')
+        local qband; qband=$(echo "$qnw" | awk -F',' '{gsub(/[" ]/,"",$3); print $3}')
+        [ -n "$qband" ] && band=$(echo "$qband" | sed 's/LTEBAND/LTE Band /;s/NRBAND/NR Band /;s/^[[:space:]]*//')
         [ -z "$earfcn" ] && earfcn=$(echo "$qnw" | awk -F',' '{gsub(/[" ]/,"",$4); print $4}')
-        [ -n "$qband" ] && band="$qband"
     fi
 
     # Dedicated signal commands as backup
