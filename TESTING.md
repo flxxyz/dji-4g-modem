@@ -4,11 +4,14 @@
 
 ## 测试环境分级
 
-| 级别 | 环境 | 要求 |
-|------|------|------|
-| **Tier 1** | PVE 7.x/8.x (Proxmox VE) | 每次发布必须全量测试 |
-| **Tier 2** | Ubuntu 22.04+, Debian 12+, Raspberry Pi OS | 每次发布必须冒烟测试 |
-| **Tier 3** | CentOS/RHEL 8+, Fedora 38+, OpenWRT 21+ | 有环境时测试，记录已知问题 |
+| 顺序 | 环境 | 要求 | 备注 |
+|------|------|------|------|
+| 1 | Ubuntu 22.04+ | 必须 | `apt`, `dhclient`, cloud image 需 `linux-modules-extra` |
+| 2 | Debian 12+ | 必须 | `apt`, `dhclient`, cdc_ether 自动绑定 |
+| 3 | CentOS/RHEL 8+ | 有环境时 | `yum`/`dnf`, `dhclient`, SELinux |
+| 4 | OpenWRT 21+ | 有环境时 | `opkg`, `udhcpc`, busybox |
+| 5 | Raspberry Pi OS | 有设备时 | `apt`, `dhclient`, 物理设备 |
+| * | PVE 7.x/8.x | 可选 | 宿主机，每轮测试的底座 |
 
 ## 测试用例
 
@@ -194,13 +197,13 @@ sudo dji4g disconnect
 
 ## 当前版本状态
 
-**v2.0.0**
-- [x] PVE 7.0 (Proxmox VE 7.0.2-2, kernel 7.0, x86_64) — 全量通过 TC01-TC18
-- [x] Debian 12 (Bookworm, kernel 6.1.0-50, x86_64 QEMU VM) — 全量通过 TC01-TC15
-- [x] Ubuntu 22.04 (Jammy, kernel 5.15.0-185-generic, x86_64 QEMU VM) — 全量通过 TC01-TC09
-- [ ] Raspberry Pi OS
-- [ ] Raspberry Pi OS
+**v2.0.0** (2026-07-18)
+- [x] Ubuntu 22.04 (Jammy, kernel 5.15.0-185-generic, x86_64 QEMU VM)
+- [x] Debian 12 (Bookworm, kernel 6.1.0-50, x86_64 QEMU VM)
+- [x] PVE 7.0 (Proxmox VE 7.0.2-2, kernel 7.0, x86_64) — 可选
 - [ ] CentOS 8+
+- [ ] OpenWRT 21+
+- [ ] Raspberry Pi OS
 - [ ] OpenWRT 21+
 
 ## RouterOS 说明
