@@ -299,6 +299,28 @@ driver_unbind() {
 modem_get_info()     { at_send "${1:-$AT_PORT}" "ATI" 3; }
 modem_get_operator() { at_send "${1:-$AT_PORT}" "AT+COPS?" 5 | grep "+COPS:" | head -1; }
 
+# Parse AT+COPS? response into human-readable operator name
+# +COPS: <mode>,<format>,<oper>,<act>
+# If <format>=2 (numeric), maps common MCC-MNC codes to names
+_parse_operator() {
+    local cops="$1"
+    if [ -z "$cops" ]; then echo "unknown"; return; fi
+    # Extract the operator field (3rd comma-separated, may be quoted)
+    local raw; raw=$(echo "$cops" | awk -F',' '{print $3}' | tr -d '" ' | tr -d '\r\n')
+    # If it's already a name (not numeric), return as-is
+    case "$raw" in
+        46000|46002|46004|46007|46008|46020) echo "China Mobile" ;;
+        46001|46006|46009) echo "China Unicom" ;;
+        46003|46005|46011) echo "China Telecom" ;;
+        46015) echo "China Broadnet" ;;
+        46020) echo "China Tietong" ;;
+        [Cc][Hh]*) echo "$raw" ;;
+        *[Uu][Nn][Ii]*) echo "$raw" ;;
+        *[Tt][Ee][Ll]*) echo "$raw" ;;
+        *) echo "$raw" ;;
+    esac
+}
+
 modem_get_signal() {
     local port="${1:-$AT_PORT}" resp rssi ber
     resp=$(at_send "$port" "AT+CSQ" 3)
@@ -999,8 +1021,9 @@ cmd_cell() {
     _need_connect || return 0
 
     # Get serving cell info
-    local qeng qnw rsrp rsrq sinr
+    local qeng qnw cops rsrp rsrq sinr
     qeng=$(at_send "$AT_PORT" 'AT+QENG="servingcell"' 5 | grep "+QENG:" | head -1)
+    cops=$(modem_get_operator "$AT_PORT")
     qnw=$(at_send "$AT_PORT" "AT+QNWINFO" 3 | grep "+QNWINFO:" | head -1)
     rsrp=$(at_send "$AT_PORT" "AT+QRSRP" 3 | grep "+QRSRP:" | head -1)
     sinr=$(at_send "$AT_PORT" "AT+QSQ" 3 | grep "+QSQ:" | head -1)
@@ -1050,7 +1073,7 @@ cmd_cell() {
     else
         header "Serving Cell"
         _keyval "Technology" "${tech:-?} ${duplex} (${state:-?})"
-        _keyval "Operator" "${mcc:-?}-${mnc:-?}"
+        _keyval "Operator" "$(_parse_operator "$cops") (${mcc:-?}-${mnc:-?})"
         _keyval "Band" "${band:-?} (EARFCN ${earfcn:-?})"
         _keyval "Bandwidth" "${bw_mhz:-?}"
         _keyval "PCI" "${pci:-?}"
