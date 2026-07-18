@@ -182,27 +182,45 @@ sudo dji4g disconnect
 # 验证：正常清理
 ```
 
+### TC-19: SMS 发送 (需要 root)
+
+```bash
+sudo dji4g connect --route
+dji4g sms send '+8617671773306' 'Test SMS from dji4g'
+```
+
+验证：返回 `+CMGS: <mr>` 和 `OK`。
+
+### TC-20: 基站信息查询
+
+```bash
+dji4g cell
+dji4g cell --json
+```
+
+验证：显示技术/运营商/频段/带宽/PCI/CellID 及信号指标，JSON 格式正确。
+
 ## 发布检查清单
 
 | # | 检查项 | |
 |---|--------|---|
 | 1 | `bash -n` 语法检查通过 | ☐ |
-| 2 | PVE (Tier 1) 全量 TC01-TC18 | ☐ |
-| 3 | Ubuntu/Debian (Tier 2) 冒烟 TC01-TC09 | ☐ |
-| 4 | Raspberry Pi OS (Tier 2) 冒烟 TC01-TC09 | ☐ |
-| 5 | CentOS/RHEL (Tier 3) 如有环境 TC01-TC05 | ☐ |
-| 6 | OpenWRT (Tier 3) 如有环境 TC01-TC05 | ☐ |
+| 2 | Ubuntu 22.04 (120) 全量 TC01-TC20 | ☐ |
+| 3 | Debian 12 (121) 全量 TC01-TC20 | ☐ |
+| 4 | CentOS/RHEL 如有环境 TC01-TC05,TC19-20 | ☐ |
+| 5 | OpenWRT 如有环境 TC01-TC05 | ☐ |
+| 6 | Raspberry Pi OS 如有设备 TC01-TC20 | ☐ |
 | 7 | `dji4g dump` 所有 debug 组无报错 | ☐ |
 | 8 | 已知问题已记录到 RELEASE_NOTES.md | ☐ |
 
 ## 当前版本状态
 
-**v2.0.0** (2026-07-18)
-- [x] Ubuntu 22.04 (Jammy, kernel 5.15.0-185-generic, x86_64 QEMU VM)
-- [x] Debian 12 (Bookworm, kernel 6.1.0-50, x86_64 QEMU VM)
-- [x] PVE 7.0 (Proxmox VE 7.0.2-2, kernel 7.0, x86_64) — 可选
-- [ ] CentOS 8+
-- [ ] OpenWRT 21+
+**v2.0.0** (2026-07-18) — 当前版本
+- [x] Ubuntu 22.04 (VM 120, kernel 5.15.0-186-generic) — TC01-TC20
+- [x] Debian 12 (VM 121, kernel 6.1.0-50) — TC01-TC15
+- [x] PVE 7.0 (宿主机, kernel 7.0.2) — 可选
+- [ ] CentOS 8+ (VM 122)
+- [ ] OpenWRT 21+ (VM 119)
 - [ ] Raspberry Pi OS
 - [ ] OpenWRT 21+
 
