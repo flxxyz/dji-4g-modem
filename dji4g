@@ -180,6 +180,49 @@ at_send() {
     echo "$raw" | grep -v "^$cmd$" | grep -v "^$" | grep -v "^AT$"
 }
 
+# ----[ SMS Operations ]----
+
+# Send SMS via AT command (text mode)
+# Args: port, phone_number, message_text
+_at_send_sms() {
+    local port="$1" phone="$2" msg="$3" t="${4:-15}"
+
+    # Set text mode
+    local resp
+    resp=$(_at_send_raw "$port" "AT+CMGF=1" 3 2>/dev/null)
+    if ! echo "$resp" | grep -q "OK"; then
+        echo "ERROR: Failed to set text mode"; return 1
+    fi
+
+    # Initiate SMS send — modem responds with "> " prompt
+    printf '%s\r' "AT+CMGS=\"$phone\"" > "$port"
+    sleep 1
+
+    # Send message body + Ctrl+Z (ASCII 26)
+    printf '%s\x1a\r' "$msg" > "$port"
+
+    # Read response
+    if command -v timeout &>/dev/null; then
+        resp=$(timeout "$t" cat "$port" 2>/dev/null)
+    else
+        ( cat "$port" 2>/dev/null ) & local cpid=$!
+        sleep "$t"; kill $cpid 2>/dev/null; wait $cpid 2>/dev/null
+        resp=""
+    fi
+
+    if echo "$resp" | grep -q "+CMGS:"; then
+        local mr; mr=$(echo "$resp" | grep "+CMGS:" | head -1 | sed 's/.*+CMGS: *//')
+        echo "OK +CMGS: $mr"
+        return 0
+    elif echo "$resp" | grep -q "ERROR"; then
+        echo "ERROR: SMS send failed (check phone number format)"
+        return 1
+    else
+        echo "ERROR: No response from modem"
+        return 1
+    fi
+}
+
 # ----[ Driver Operations ]----
 
 _need_root() {
@@ -201,6 +244,22 @@ _need_connect() {
 
 driver_load_all() {
     local errors=0
+
+    # Unbind from usbfs first (leftover from QEMU USB passthrough)
+    if [ -d /sys/bus/usb/drivers/usbfs ]; then
+        for dev in /sys/bus/usb/devices/*/idVendor; do
+            [ "$(cat "$dev" 2>/dev/null)" = "$USB_VID" ] || continue
+            local usb_dev; usb_dev=$(basename "$(dirname "$dev")")
+            for iface in /sys/bus/usb/devices/${usb_dev}/${usb_dev}:*/driver; do
+                local drv; drv=$(readlink "$iface" 2>/dev/null)
+                if echo "$drv" | grep -q 'usbfs'; then
+                    local ifname; ifname=$(basename "$(dirname "$iface")")
+                    echo -n "$ifname" > /sys/bus/usb/drivers/usbfs/unbind 2>/dev/null || true
+                fi
+            done
+        done
+    fi
+
     for mod in option cdc_ether rndis_host usbnet; do
         if ! modprobe "$mod" 2>/dev/null; then
             # modprobe fails without root; if module already loaded it's harmless
@@ -906,6 +965,34 @@ cmd_preflight() {
 
 # ----[ Commands ]----
 
+cmd_sms() {
+    local action="${1:-}"
+    case "$action" in
+        send)
+            shift
+            local phone="$1" msg="$2"
+            [ -z "$phone" ] && die 1 "Usage: dji4g sms send <phone> <message>"
+            [ -z "$msg" ] && die 1 "Usage: dji4g sms send <phone> <message>"
+            _need_connect || return 0
+            info "Sending SMS to $phone..."
+            local result
+            result=$(_at_send_sms "$AT_PORT" "$phone" "$msg" 15)
+            if echo "$result" | grep -q "^OK"; then
+                ok "SMS sent — $(echo "$result" | grep '+CMGS:' | head -1)"
+            else
+                fail "SMS send failed"; echo "$result"
+                return 1
+            fi
+            ;;
+        *)
+            echo "Usage: dji4g sms <command>"
+            echo ""
+            echo "Commands:"
+            echo "  send <phone> <msg>   Send SMS (text mode)"
+            ;;
+    esac
+}
+
 cmd_connect() {
     _need_root "connect"
     _preflight_check || return $?
@@ -1288,6 +1375,7 @@ cmd_help() {
             echo ""; echo "Usage: dji4g <command> [options]"
             echo ""; echo "Commands:"
             echo "  preflight     Check dependencies (--fix to auto-install)"
+            echo "  sms           SMS operations (send <phone> <msg>)"
             echo "  connect       Bring up 4G connection (ECM + DHCP, no default route)"
             echo "  disconnect    Tear down connection"
             echo "  route         Manage default route (add|del|show)"
@@ -1321,6 +1409,7 @@ parse_args() {
 
     case "$command" in
         preflight)    cmd_preflight "$@" ;;
+        sms)          cmd_sms "$@" ;;
         connect)      cmd_connect "$@" ;;
         disconnect)   cmd_disconnect "$@" ;;
         route)        cmd_route "$@" ;;
