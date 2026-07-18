@@ -993,6 +993,78 @@ cmd_sms() {
     esac
 }
 
+cmd_cell() {
+    local json=false
+    [ "$1" = "--json" ] && json=true
+    _need_connect || return 0
+
+    # Get serving cell info
+    local qeng qnw rsrp rsrq sinr
+    qeng=$(at_send "$AT_PORT" 'AT+QENG="servingcell"' 5 | grep "+QENG:" | head -1)
+    qnw=$(at_send "$AT_PORT" "AT+QNWINFO" 3 | grep "+QNWINFO:" | head -1)
+    rsrp=$(at_send "$AT_PORT" "AT+QRSRP" 3 | grep "+QRSRP:" | head -1)
+    sinr=$(at_send "$AT_PORT" "AT+QSQ" 3 | grep "+QSQ:" | head -1)
+
+    if [ -z "$qeng" ] && [ -z "$qnw" ]; then
+        echo "Cell info not available"; return 1
+    fi
+
+    # Parse QENG: comma-separated, fields vary by <tech>
+    # LTE: state,tech,duplex,MCC,MNC,cellID,PCID,earfcn,band,bw,TAC,?,?,RSRP,RSRQ,RSSI,SINR,scell_rsrp,scell_sinr
+    local mcc="" mnc="" cellid="" pci="" earfcn="" bw="" bw_mhz="" tac=""
+    local q_rsrp="" q_rsrq="" q_rssi="" q_sinr="" state="" duplex=""
+    if [ -n "$qeng" ]; then
+        # Use awk to split and clean: strip quotes and spaces from each field
+        _qfield() { echo "$qeng" | awk -F',' -v n="$1" '{gsub(/[" ]/,"",$n); print $n}'; }
+        state=$(_qfield 2)
+        tech=$(_qfield 3)
+        duplex=$(_qfield 4)
+        mcc=$(_qfield 5); mnc=$(_qfield 6)
+        cellid=$(_qfield 7)
+        pci=$(_qfield 8)
+        earfcn=$(_qfield 9)
+        bw=$(_qfield 11)  # bw index: 0=1.4,1=3,2=5,3=10,4=15,5=20
+        tac=$(_qfield 12)
+        q_rsrp=$(_qfield 14); q_rsrq=$(_qfield 15)
+        q_rssi=$(_qfield 16); q_sinr=$(_qfield 17)
+        # Decode bandwidth
+        case "$bw" in 0) bw_mhz="1.4 MHz" ;; 1) bw_mhz="3 MHz" ;; 2) bw_mhz="5 MHz" ;; 3) bw_mhz="10 MHz" ;; 4) bw_mhz="15 MHz" ;; 5) bw_mhz="20 MHz" ;; *) bw_mhz="${bw}" ;; esac
+    fi
+
+    # QNWINFO fallback: tech, band, earfcn
+    if [ -n "$qnw" ]; then
+        [ -z "$tech" ] && tech=$(echo "$qnw" | awk -F',' '{gsub(/[" ]/,"",$1); sub(/\+QNWINFO:/,""); print $1}')
+        local qband; qband=$(echo "$qnw" | awk -F',' '{gsub(/[" ]/,"",$3); print $3}' | sed 's/LTEBAND/LTE Band /;s/NRBAND/NR Band /')
+        [ -z "$earfcn" ] && earfcn=$(echo "$qnw" | awk -F',' '{gsub(/[" ]/,"",$4); print $4}')
+        [ -n "$qband" ] && band="$qband"
+    fi
+
+    # Dedicated signal commands as backup
+    [ -z "$q_rsrp" ] && [ -n "$rsrp" ] && q_rsrp=$(echo "$rsrp" | grep -oP '[-]?\d+' | head -1)
+    [ -z "$q_sinr" ] && [ -n "$sinr" ] && q_sinr=$(echo "$sinr" | grep -oP '[-]?\d+' | head -1)
+
+    if $json; then
+        printf '{"technology":"%s","duplex":"%s","mcc":"%s","mnc":"%s","band":"%s","earfcn":%s,"bandwidth":"%s","pci":%s,"cell_id":"%s","tac":"%s","rsrp":%s,"rsrq":%s,"rssi":%s,"sinr":%s,"state":"%s"}\n' \
+            "${tech:-?}" "${duplex:-?}" "${mcc:-?}" "${mnc:-?}" "${band:-?}" "${earfcn:-?}" "${bw_mhz:-?}" \
+            "${pci:-?}" "${cellid:-?}" "${tac:-?}" "${q_rsrp:-?}" "${q_rsrq:-?}" "${q_rssi:-?}" "${q_sinr:-?}" "${state:-?}"
+    else
+        header "Serving Cell"
+        _keyval "Technology" "${tech:-?} ${duplex} (${state:-?})"
+        _keyval "Operator" "${mcc:-?}-${mnc:-?}"
+        _keyval "Band" "${band:-?} (EARFCN ${earfcn:-?})"
+        _keyval "Bandwidth" "${bw_mhz:-?}"
+        _keyval "PCI" "${pci:-?}"
+        _keyval "Cell ID" "${cellid:-?}"
+        _keyval "TAC" "${tac:-?}"
+        echo ""
+        header "Signal Metrics"
+        _keyval "RSRP" "${q_rsrp:-?} dBm"
+        _keyval "RSRQ" "${q_rsrq:-?} dB"
+        _keyval "RSSI" "${q_rssi:-?} dBm"
+        _keyval "SINR" "${q_sinr:-?} dB"
+    fi
+}
+
 cmd_connect() {
     _need_root "connect"
     _preflight_check || return $?
@@ -1376,6 +1448,7 @@ cmd_help() {
             echo ""; echo "Commands:"
             echo "  preflight     Check dependencies (--fix to auto-install)"
             echo "  sms           SMS operations (send <phone> <msg>)"
+            echo "  cell          Cell tower & band info (--json)"
             echo "  connect       Bring up 4G connection (ECM + DHCP, no default route)"
             echo "  disconnect    Tear down connection"
             echo "  route         Manage default route (add|del|show)"
@@ -1410,6 +1483,7 @@ parse_args() {
     case "$command" in
         preflight)    cmd_preflight "$@" ;;
         sms)          cmd_sms "$@" ;;
+        cell)         cmd_cell "$@" ;;
         connect)      cmd_connect "$@" ;;
         disconnect)   cmd_disconnect "$@" ;;
         route)        cmd_route "$@" ;;
