@@ -11,6 +11,7 @@
 | 3 | CentOS/RHEL 8+ | 有环境时 | `yum`/`dnf`, `dhclient`, SELinux |
 | 4 | OpenWRT 21+ | 有环境时 | `opkg`, `udhcpc`, busybox |
 | 5 | Raspberry Pi OS | 有设备时 | `apt`, `dhclient`, 物理设备 |
+| 6 | RouterOS 7.x | 有环境时 | 目标版本 7.19.6，需单独适配 |
 | * | PVE 7.x/8.x | 可选 | 宿主机，每轮测试的底座 |
 
 ## 测试用例
@@ -222,6 +223,7 @@ dji4g cell --json
 - [ ] CentOS 8+ (VM 122)
 - [ ] OpenWRT 21+ (VM 119)
 - [ ] Raspberry Pi OS
+- [ ] RouterOS 7.19.6 (VM 123)
 - [ ] OpenWRT 21+
 
 ## RouterOS 说明

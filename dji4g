@@ -18,8 +18,9 @@
 #   Install:   curl -fsSL https://dji-4g-modem.sao.sh | sh
 #   License:   MIT
 #
-#   Supported: PVE, Ubuntu, Debian, CentOS, Raspberry Pi OS, OpenWRT
-#   Not supported: macOS (no CDC ECM driver), RouterOS (proprietary userland)
+#   Supported: PVE, Ubuntu, Debian, CentOS, Raspberry Pi OS, OpenWRT, RouterOS
+#              x86_64 / arm64 / armhf
+#   Manual setup required: macOS (no CDC ECM driver on Apple Silicon)
 #
 #===============================================================================
 set -o pipefail

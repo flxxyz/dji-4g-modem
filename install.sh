@@ -11,9 +11,12 @@
 #   DJI 1st-gen 4G USB Module — CLI Manager v2.0.0
 #   A Linux toolkit to turn a DJI drone accessory into a proper USB 4G modem
 #
-#   Author:  flxxyz (https://github.com/flxxyz)
-#   Repo:    https://github.com/flxxyz/dji-4g-modem
-#   Install: curl -fsSL https://dji-4g-modem.sao.sh | sh
+#   Author:     flxxyz (https://github.com/flxxyz)
+#   Repo:       https://github.com/flxxyz/dji-4g-modem
+#   Install:    curl -fsSL https://dji-4g-modem.sao.sh | sh
+#   Supported:  PVE, Ubuntu, Debian, CentOS, Raspberry Pi OS, OpenWRT, RouterOS
+#               x86_64 / arm64 / armhf
+#   License:    MIT
 #
 #===============================================================================
 set -euo pipefail
