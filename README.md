@@ -14,17 +14,21 @@
 - **看基站** — 频段/信号/PCI 一目了然
 - **6 层诊断** — 从 USB 物理层到 HTTP 应用层
 
-## 快速开始
+## 安装
 
 ```bash
-# 下载
+# 一键安装（推荐）
+curl -fsSL https://dji-4g-modem.sao.sh/install.sh | bash
+
+# 或者从 GitHub
 git clone https://github.com/flxxyz/dji-4g-modem.git
 cd dji-4g-modem
+sudo bash install.sh
+```
 
-# 安装
-sudo cp dji4g /usr/local/bin/
-sudo chmod +x /usr/local/bin/dji4g
+安装脚本会：检测发行版 → 装系统依赖 → 检查内核 → 下载 dji4g → 验证安装。
 
+```bash
 # 插上 4G 模块，一键上线
 sudo dji4g connect --route
 ```
