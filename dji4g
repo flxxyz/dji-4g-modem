@@ -1091,11 +1091,12 @@ cmd_cell() {
 cmd_connect() {
     _need_root "connect"
     _preflight_check || return $?
-    local force=false apn="$DEFAULT_APN" add_route=false
+    local force=false apn="$DEFAULT_APN" add_route=false no_reconnect=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --force) force=true ;;
             --route) add_route=true ;;
+            --no-reconnect) no_reconnect=true ;;
             --apn) shift; apn="$1" ;;
         esac; shift
     done
@@ -1165,6 +1166,37 @@ cmd_connect() {
         fi
         local sig; sig=$(modem_get_signal "$AT_PORT"); _keyval "Signal" "$(echo "$sig" | awk '{print $1}') RSSI"
     else warn "Interface is up but ping failed. Check debug connectivity for details."; fi
+
+    if ! $no_reconnect; then
+        echo ""
+        info "Watchdog active (Ctrl+C to stop, or use --no-reconnect)..."
+        local failures=0
+        while true; do
+            sleep 10
+            # Check: device present + interface up with IP
+            if ! find_device 2>/dev/null; then
+                warn "Device lost. Waiting for reinsert..."
+                sleep 5; continue
+            fi
+            local cur_iface cur_ip
+            cur_iface=$(find_net_iface 2>/dev/null)
+            cur_ip=$(ip -4 addr show "$cur_iface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1 | head -1)
+            if [ -z "$cur_ip" ] || ! ping -c 1 -W 3 "$MODULE_GATEWAY" >/dev/null 2>&1; then
+                failures=$((failures + 1))
+                warn "Link down ($failures/3). Reconnecting..."
+                if [ $failures -ge 3 ]; then
+                    info "Reconnecting..."
+                    cmd_disconnect 2>/dev/null
+                    sleep 2
+                    local recon_args=""
+                    $add_route && recon_args="--route"
+                    cmd_connect $recon_args 2>/dev/null && failures=0 || warn "Reconnect failed, retrying..."
+                fi
+            else
+                [ $failures -gt 0 ] && ok "Link recovered ($cur_ip)" && failures=0
+            fi
+        done
+    fi
 }
 
 cmd_disconnect() {
@@ -1454,7 +1486,7 @@ cmd_env() {
 cmd_help() {
     local cmd="${1:-}"
     case "$cmd" in
-        connect)   echo "Usage: dji4g connect [--force] [--route] [--apn APN]"; echo ""; echo "Bring up 4G connection. --route also adds default route."; echo "  --force  Force CFUN reset before connecting"; echo "  --route  Add default route via 4G module after connecting"; echo "  --apn    Set APN (default: $DEFAULT_APN)" ;;
+        connect)   echo "Usage: dji4g connect [--force] [--route] [--no-reconnect] [--apn APN]"; echo ""; echo "Bring up 4G connection with auto-reconnect by default."; echo "  --force         CFUN reset before connecting"; echo "  --route         Add default route via 4G module"; echo "  --no-reconnect  One-shot mode, exit after connect (no watchdog)"; echo "  --apn APN       Set APN (default: $DEFAULT_APN)" ;;
         disconnect) echo "Usage: dji4g disconnect"; echo ""; echo "Tear down connection: remove route, release DHCP, unbind drivers." ;;
         route)     echo "Usage: dji4g route <add|del|show>"; echo ""; echo "Manage default route through 4G module."; echo "  add    Add default route via $MODULE_GATEWAY"; echo "  del    Remove default route via $MODULE_GATEWAY"; echo "  show   Show current routes via module" ;;
         status)    echo "Usage: dji4g status [--json] [--watch N]"; echo ""; echo "Show connection status. --watch for live refresh." ;;
