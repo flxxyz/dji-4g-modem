@@ -99,7 +99,8 @@ check_tools() {
             check_tool "$DHCP_CLIENT" "${DHCP_CLIENT}" "DHCP client required"
             ;;
         openwrt)
-            # OpenWRT: tools in /usr/sbin, busybox-based
+            # OpenWRT: busybox-based, needs bash
+            [ -x /bin/bash ] || warn "bash not found (opkg install bash)"
             [ -x /usr/sbin/lsusb ] || [ -x /bin/lsusb ] || warn "lsusb not found (opkg install usbutils)"
             [ -n "$DHCP_CLIENT" ] || warn "No DHCP client found (opkg install udhcpc)"
             ;;
