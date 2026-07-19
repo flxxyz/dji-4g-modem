@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #===============================================================================
-# dji4g installer — https://dji-4g-modem.sao.sh
-# Run:  curl -fsSL https://dji-4g-modem.sao.sh/install.sh | bash
+# dji4g installer
+# Usage:  curl -fsSL https://dji-4g-modem.sao.sh | sh
 #===============================================================================
 set -euo pipefail
 

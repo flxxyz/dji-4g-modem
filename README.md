@@ -17,13 +17,8 @@
 ## 安装
 
 ```bash
-# 一键安装（推荐）
-curl -fsSL https://dji-4g-modem.sao.sh/install.sh | bash
-
-# 或者从 GitHub
-git clone https://github.com/flxxyz/dji-4g-modem.git
-cd dji-4g-modem
-sudo bash install.sh
+# 一键安装
+curl -fsSL https://dji-4g-modem.sao.sh | sh
 ```
 
 安装脚本会：检测发行版 → 装系统依赖 → 检查内核 → 下载 dji4g → 验证安装。
