@@ -58,7 +58,7 @@ dji4g route del                 # 移除默认路由
 | CentOS/RHEL 8+ | ✅ | — | — |
 | Raspberry Pi OS | — | ✅ | ✅ |
 | OpenWRT 21+ | ✅ | ✅ | — |
-| RouterOS 7.x | ✅ | — | — |
+| RouterOS 7.x | ✅ | ✅ | — |
 
 ## 硬件
 
