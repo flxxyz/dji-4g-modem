@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
 #===============================================================================
-# dji4g -- DJI 1st-gen 4G USB Module CLI Manager
-# Device:  2ca3:4006 "Baiwang" (ZTE V1E / Quectel QDC507)
-# Target:  Linux (PVE, Ubuntu, Debian, CentOS, Raspberry Pi OS, OpenWRT)
-# Note:    RouterOS is not supported (non-Linux userland, needs separate impl.)
-# Version: 2.0.0
+#
+#   ██████╗      ██╗██╗ ██╗ ██████╗  ██████╗
+#   ██╔══██╗     ██║██║ ██║██╔════╝ ██╔════╝
+#   ██║  ██║     ██║███████║██║  ███╗██║  ███╗
+#   ██║  ██║██   ██║╚════██║██║   ██║██║   ██║
+#   ██████╔╝╚█████╔╝     ██║╚██████╔╝╚██████╔╝
+#   ╚═════╝  ╚════╝     ╚═╝ ╚═════╝  ╚═════╝
+#
+#   DJI 1st-gen 4G USB Module — CLI Manager
+#   Turn your DJI drone accessory into a proper Linux USB 4G modem.
+#
+#   Device:    2ca3:4006 "Baiwang" (ZTE V1E / Quectel QDC507)
+#   Version:   2.0.0
+#   Author:    flxxyz (https://github.com/flxxyz)
+#   Repo:      https://github.com/flxxyz/dji-4g-modem
+#   Install:   curl -fsSL https://dji-4g-modem.sao.sh | sh
+#   License:   MIT
+#
+#   Supported: PVE, Ubuntu, Debian, CentOS, Raspberry Pi OS, OpenWRT
+#   Not supported: macOS (no CDC ECM driver), RouterOS (proprietary userland)
+#
 #===============================================================================
 set -o pipefail
 
