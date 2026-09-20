@@ -11,7 +11,7 @@
 ## 安装
 
 ```bash
-curl -fsSL https://dji-4g-modem.sao.sh | sh
+curl -fsSL https://dji-4g-modem.sao.sh/install.sh | sh
 ```
 
 安装脚本自动完成：检测发行版 → 装系统依赖 → 检查内核 → 下载 → 验证。

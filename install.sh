@@ -13,7 +13,7 @@
 #
 #   Author:     flxxyz (https://github.com/flxxyz)
 #   Repo:       https://github.com/flxxyz/dji-4g-modem
-#   Install:    curl -fsSL https://dji-4g-modem.sao.sh | sh
+#   Install:    curl -fsSL https://dji-4g-modem.sao.sh/install.sh | sh
 #   Supported:  PVE, Ubuntu, Debian, CentOS, Raspberry Pi OS, OpenWRT, RouterOS
 #               x86_64 / arm64 / armhf (RouterOS CHR supports both)
 #   License:    MIT
